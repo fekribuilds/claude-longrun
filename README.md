@@ -9,7 +9,7 @@ budget and a goal, go away, and come back to finished work.
 ## Install (works in every project)
 
 ```bash
-claude plugin marketplace add <github-user>/claude-longrun
+claude plugin marketplace add fekribuilds/claude-longrun
 claude plugin install longrun@claude-longrun
 ```
 
@@ -18,7 +18,7 @@ the same two commands on their machine. Update later with
 `claude plugin marketplace update claude-longrun`, then restart Claude Code or run
 `/reload-plugins`.
 
-Inside Claude Code you can do the same with `/plugin marketplace add <github-user>/claude-longrun`.
+Inside Claude Code you can do the same with `/plugin marketplace add fekribuilds/claude-longrun`.
 
 ## Use
 
