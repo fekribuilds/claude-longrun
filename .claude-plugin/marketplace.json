@@ -1,0 +1,12 @@
+{
+  "name": "claude-longrun",
+  "description": "Timed autonomous runs for Claude Code",
+  "owner": { "name": "REPLACE_WITH_YOUR_NAME" },
+  "plugins": [
+    {
+      "name": "longrun",
+      "source": "./plugins/longrun",
+      "description": "Keep Claude working until a deadline, stop early when truly done, switch models by usage limits, pause and resume around rate limits."
+    }
+  ]
+}

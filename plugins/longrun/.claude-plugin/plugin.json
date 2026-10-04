@@ -1,0 +1,6 @@
+{
+  "name": "longrun",
+  "version": "0.1.0",
+  "description": "Timed autonomous runs: keeps Claude working until a deadline, stops early when truly done, switches models by usage limits, and pauses/resumes around rate-limit windows.",
+  "license": "MIT"
+}
