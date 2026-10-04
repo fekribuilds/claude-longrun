@@ -18,7 +18,7 @@ const stopInput = (last: string) => ({
   last_assistant_message: last,
 })
 
-async function boot($: any, on: any, five = 20, resetsAt?: string) {
+async function boot($: any, on: any, five = 20, resetsAt?: string, hours = '2') {
   const clock = mock.clock(on)
   mock.store(on, {})
   on('session.start', ($: any, e: any) => ({ cwd: e.cwd }))
@@ -30,13 +30,30 @@ async function boot($: any, on: any, five = 20, resetsAt?: string) {
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', () => ({ value: undefined }))
   on('ui.log', () => ({ value: undefined }))
-  on('prompt.submit', () => ({ value: undefined }))
+  on('prompt.submit', ($: any, e: any) => {
+    submitted.push(e.text)
+    return { text: e.text }
+  })
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
-  await $.command.run({ command: 'longrun', args: '2 build the thing', origin: { kind: 'composer' } })
+  await $.command.run({ command: 'longrun', args: `${hours} build the thing`, origin: { kind: 'composer' } })
   return clock
 }
 
+const submitted: string[] = []
+
 describe('register', () => {
+  test('starting a run sends the kickoff prompt from the timer', async ($, on) => {
+    submitted.length = 0
+    const clock: any = await boot($, on)
+    expect(submitted).toEqual([]) // nothing is sent from inside the command handler
+    await clock.advance(1500)
+    expect(submitted.length).toBe(1)
+    expect(submitted[0]).toContain('LONG RUN MODE')
+    expect(submitted[0]).toContain('build the thing')
+    const status: any = await $.command.run({ command: 'longrun', args: 'status', origin: { kind: 'composer' } })
+    expect(status.text).toContain('Last prompt sent by longrun: sent')
+  })
+
   test('blocks the stop while time remains and Claude has not claimed done', async ($, on) => {
     await boot($, on)
     const r: any = await $.classic.Stop(stopInput('I changed a file.'))
@@ -53,8 +70,8 @@ describe('register', () => {
   })
 
   test('after the deadline: one wrap-up turn, then it may stop', async ($, on) => {
-    const clock: any = await boot($, on)
-    await clock.advance(3 * 3_600_000)
+    const clock: any = await boot($, on, 20, undefined, '0.002') // about 7 seconds
+    await clock.advance(9_000)
     const wrap: any = await $.classic.Stop(stopInput('still going'))
     expect(wrap.block).toContain('Time is up')
     const done: any = await $.classic.Stop(stopInput('summary'))

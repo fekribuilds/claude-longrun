@@ -17,7 +17,7 @@ const CONFIG = {
   marker: 'LONGRUN_DONE',
   /** "Are you really done?" audits before an early finish is accepted. */
   auditPasses: 1,
-  /** Best/most expensive first. Each threshold in stepDownAt moves one tier down. */
+  /** Index 0 is your own model (never forced). Each threshold in stepDownAt moves one tier down. */
   ladder: ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-4-5-20251001'],
   /** Highest rate-limit % used (5h, 7d or spend) at which to step down a tier. */
   stepDownAt: [70, 90],
@@ -99,9 +99,11 @@ function summarize(u: SessionUsage): Snap {
   }
 }
 
-function pickModel(s: Snap): string {
+/** undefined = leave the session's own model alone (limits are low). */
+function pickModel(s: Snap): string | undefined {
   const tier = CONFIG.stepDownAt.filter((t) => s.pressure >= t).length
-  return CONFIG.ladder[Math.min(tier, CONFIG.ladder.length - 1)] ?? CONFIG.ladder[0]!
+  if (tier === 0) return undefined
+  return CONFIG.ladder[Math.min(tier, CONFIG.ladder.length - 1)]
 }
 
 function budgetLine(s: Snap, left: number, model: string): string {
@@ -196,6 +198,8 @@ export const register: Register = (on) => {
   let storeKey = 'longrun'
   let toolCalls = 0
   let lastModel = ''
+  const outbox: string[] = []
+  let lastSubmit = 'none yet'
 
   on('session.start', async ($, e, next) => {
     storeKey = `longrun:${await $.session.id()}`
@@ -209,6 +213,22 @@ export const register: Register = (on) => {
       const s = summarize(await $.session.usage())
       const pause = run.pausedUntil ? `paused until reset (${fmt(run.pausedUntil - now)}) | ` : ''
       $.ui.status(`longrun ${pause}${budgetLine(s, run.deadline - now, lastModel)}`)
+    })
+
+    // Prompts to send are queued here and sent from this timer, the documented
+    // pattern for starting a turn from outside an event.
+    $.clock.every(1000, async () => {
+      const text = outbox.shift()
+      if (!text) return
+      lastSubmit = 'sending'
+      try {
+        const r = await $.prompt.submit({ text })
+        lastSubmit = r.drop ? `dropped: ${r.drop}` : 'sent'
+        if (r.drop) $.ui.toast(`longrun: prompt dropped: ${r.drop}`)
+      } catch (err) {
+        lastSubmit = `failed: ${String(err)}`
+        $.ui.toast(`longrun: could not start a turn: ${String(err)}`)
+      }
     })
 
     // Register last: a refused registration must not skip the rest.
@@ -235,12 +255,12 @@ export const register: Register = (on) => {
     const args = (e.args ?? '').trim()
 
     if (args === 'stop') {
-      if (!run?.active) return { text: 'longrun: no active run.' }
+      if (!run?.active) return { text: 'no active run.' }
       run.active = false
       run.ended = 'stopped by you'
       await $.store.set(storeKey, run)
       $.ui.status(undefined)
-      return { text: 'longrun: run stopped. Claude will stop at its next turn end.' }
+      return { text: 'run stopped. Claude will stop at its next turn end.' }
     }
 
     if (args === 'status' || args === '') {
@@ -251,13 +271,13 @@ export const register: Register = (on) => {
       }
       const now = await $.clock.now()
       const s = summarize(await $.session.usage())
-      return { text: `longrun: ${budgetLine(s, run.deadline - now, lastModel)}\nGoal: ${run.goal}` }
+      return { text: `${budgetLine(s, run.deadline - now, lastModel)}\nGoal: ${run.goal}\nLast prompt sent by longrun: ${lastSubmit}` }
     }
 
     const m = /^([0-9]*\.?[0-9]+)\s*h?\s*([\s\S]*)$/.exec(args)
-    if (!m) return { text: 'longrun: usage is /longrun <hours> <goal>, e.g. /longrun 6 finish the billing refactor' }
+    if (!m) return { text: 'usage is /longrun <hours> <goal>, e.g. /longrun 6 finish the billing refactor' }
     const hours = Number(m[1])
-    if (!(hours > 0) || hours > 48) return { text: 'longrun: hours must be between 0 and 48.' }
+    if (!(hours > 0) || hours > 48) return { text: 'hours must be between 0 and 48.' }
     const goal = (m[2] ?? '').trim() || 'continue the current task and finish everything outstanding'
 
     const now = await $.clock.now()
@@ -272,9 +292,10 @@ export const register: Register = (on) => {
     }
     toolCalls = 0
     await $.store.set(storeKey, run)
-    // Queued until the session is idle; do not await it inside this handler.
-    void $.prompt.submit({ text: kickoff(goal, hours) }).catch(() => undefined)
-    return { text: `longrun: started, ${hours}h budget. Goal: ${goal}` }
+    // Sent by the session.start timer; awaiting a submit inside a hook can hang.
+    outbox.push(kickoff(goal, hours))
+    lastSubmit = 'queued'
+    return { text: `started, ${hours}h budget. Goal: ${goal}` }
   })
 
   // Safety net: a long run is usually unattended with permissions bypassed.
@@ -309,12 +330,14 @@ export const register: Register = (on) => {
   on('turn.step', async function* ($, e, next) {
     if (!run?.active || e.agentId) return yield* next(e)
     const s = summarize(await $.session.usage())
-    const model = pickModel(s)
-    if (model !== lastModel) {
-      if (lastModel) $.ui.log(`longrun: model ${short(lastModel)} -> ${short(model)} (limits at ${pct(s.pressure)})`)
-      lastModel = model
+    const forced = pickModel(s)
+    const target = forced ?? e.model
+    if (target !== lastModel) {
+      if (lastModel) $.ui.log(`longrun: model ${short(lastModel)} -> ${short(target)} (limits at ${pct(s.pressure)})`)
+      lastModel = target
     }
-    return yield* next({ ...e, model })
+    // Only rewrite the request when limits force a step down.
+    return yield* next(forced && forced !== e.model ? { ...e, model: forced } : e)
   })
 
   // Keep the status line fresh after every turn.
@@ -353,8 +376,7 @@ export const register: Register = (on) => {
       $.clock.after(Math.max(1000, d.until - now), async () => {
         if (!run?.active) return
         run.pausedUntil = undefined
-        await $.store.set(storeKey, run)
-        void $.prompt.submit({ text: 'The usage-limit window has reset. Continue the long run where you left off.' }).catch(() => undefined)
+        outbox.push('The usage-limit window has reset. Continue the long run where you left off.')
       })
       return next(e)
     }
