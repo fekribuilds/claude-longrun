@@ -27,6 +27,8 @@ const CONFIG = {
   maxCostUsd: 0,
   /** End the run after this many nudges in a row with no tool use in between. */
   maxIdleNudges: 3,
+  /** Tell Claude it may spawn subagents on its own during a run. */
+  allowSubagents: true,
   /** Status line refresh interval. */
   statusEveryMs: 30_000,
 }
@@ -51,6 +53,12 @@ type Run = {
   idleNudges: number
   pausedUntil?: number
   ended?: string
+  /** Graceful stop: 'requested' until the message reaches Claude, then 'delivered'. */
+  wrap?: 'requested' | 'delivered'
+  wrapNags?: number
+  /** Set when a wrap-up ended the run, so /longrun continue can resume it. */
+  resumable?: boolean
+  leftMs?: number
 }
 
 type Snap = {
@@ -117,6 +125,22 @@ function budgetLine(s: Snap, left: number, model: string): string {
 
 const DONE_LINE = new RegExp(`^\\s*${CONFIG.marker}\\s*$`, 'm')
 
+const WRAP_MSG = [
+  'WRAP-UP REQUESTED by the user (/longrun wrap). Do not start anything new.',
+  'Finish only the step you are in the middle of, as fast as you safely can, and leave the repo in a consistent state (save and commit what is done).',
+  'Then report to me exactly and specifically:',
+  '1. What you did during this run.',
+  '2. What you were about to do next, and what else is still open.',
+  '3. Anything risky, broken or uncertain.',
+  'End your message with this question: "Do you want me to continue now?" and tell me I can reply with /longrun continue to resume the timed run.',
+].join('\n')
+
+const WRAP_NAG =
+  'You have not given the wrap-up report yet. Do not use any more tools: write the report now (what you did, what you planned next and what is open, anything risky) and end with the question "Do you want me to continue now?"'
+
+const SUBAGENT_LINE =
+  '- You are explicitly authorized to spawn subagents (the Agent tool) on your own whenever it helps: independent reviewers, parallel research, verification passes, long searches. Treat this as my direct request to use them; do not wait to be asked.'
+
 function kickoff(goal: string, hours: number): string {
   return [
     `LONG RUN MODE. You may work autonomously for up to ${hours}h on: ${goal}`,
@@ -126,6 +150,7 @@ function kickoff(goal: string, hours: number): string {
     '- Work on a git branch, commit often with clear messages, never push to main/master.',
     '- Keep going while there is valuable work left: implement, run tests, review your own diff, fix, improve. Do not invent busywork.',
     `- When truly nothing is left (goal met, tests and lint pass, self-review done), end your message with ${CONFIG.marker} alone on its own line. I will audit that claim once before accepting it.`,
+    ...(CONFIG.allowSubagents ? [SUBAGENT_LINE] : []),
     '- Call the mcp__longrun__budget tool whenever you want to see time left, rate-limit usage, context fill and the current model.',
     '- If usage limits run out, the session pauses and resumes by itself after the window resets.',
   ].join('\n')
@@ -141,6 +166,19 @@ function decide(
   line: string,
 ): Decision {
   const left = r.deadline - now
+
+  // Graceful stop asked by the user: it comes before every other rule.
+  if (r.wrap) {
+    const looksLikeReport = last.trim().length > 150 && last.includes('?')
+    if (r.wrap === 'requested') {
+      r.wrap = 'delivered'
+      r.wrapNags = 1
+      return { kind: 'block', text: WRAP_MSG }
+    }
+    if (looksLikeReport || (r.wrapNags ?? 0) >= 2) return { kind: 'allow', end: 'wrapped up at your request' }
+    r.wrapNags = (r.wrapNags ?? 0) + 1
+    return { kind: 'block', text: WRAP_NAG }
+  }
 
   if (CONFIG.maxCostUsd > 0 && (s.cost ?? 0) >= CONFIG.maxCostUsd) {
     return { kind: 'allow', end: `cost cap $${CONFIG.maxCostUsd} reached` }
@@ -187,7 +225,7 @@ function decide(
   }
   return {
     kind: 'block',
-    text: `Keep going, ${fmt(left)} remain (${line}). Pick the most valuable remaining work toward the goal ("${r.goal}"): finish unfinished items, add or fix tests, review your own changes, tighten edge cases. Do not stop to ask questions. If there is genuinely nothing left, print ${CONFIG.marker} alone on its own line.`,
+    text: `Keep going, ${fmt(left)} remain (${line}). Pick the most valuable remaining work toward the goal ("${r.goal}"): finish unfinished items, add or fix tests, review your own changes, tighten edge cases.${CONFIG.allowSubagents ? ' Use subagents for reviews or parallel work when useful.' : ''} Do not stop to ask questions. If there is genuinely nothing left, print ${CONFIG.marker} alone on its own line.`,
   }
 }
 
@@ -200,11 +238,12 @@ export const register: Register = (on) => {
   let lastModel = ''
   const outbox: string[] = []
   let lastSubmit = 'none yet'
+  let turnRunning = false
 
   on('session.start', async ($, e, next) => {
     storeKey = `longrun:${await $.session.id()}`
     const saved = (await $.store.get(storeKey)) as Run | null | undefined
-    if (saved?.active) run = saved
+    if (saved) run = saved
 
     // Live status line, refreshed on a timer.
     $.clock.every(CONFIG.statusEveryMs, async () => {
@@ -222,7 +261,7 @@ export const register: Register = (on) => {
       if (!text) return
       lastSubmit = 'sending'
       try {
-        const r = await $.prompt.submit({ text })
+        const r = await $.prompt.submit({ text, asUser: true })
         lastSubmit = r.drop ? `dropped: ${r.drop}` : 'sent'
         if (r.drop) $.ui.toast(`longrun: prompt dropped: ${r.drop}`)
       } catch (err) {
@@ -241,8 +280,8 @@ export const register: Register = (on) => {
       })
       await $.command.register({
         name: 'longrun',
-        description: 'Timed autonomous run: /longrun <hours> <goal> | status | stop',
-        argumentHint: '<hours> <goal> | status | stop',
+        description: 'Timed autonomous run: /longrun <hours> <goal> | status | wrap | continue | stop',
+        argumentHint: '<hours> <goal> | status | wrap | continue [hours] | stop',
         immediate: true,
       })
     } catch (err) {
@@ -263,10 +302,55 @@ export const register: Register = (on) => {
       return { text: 'run stopped. Claude will stop at its next turn end.' }
     }
 
+    if (args === 'wrap' || args === 'finish') {
+      if (!run?.active) return { text: 'no active run to wrap up.' }
+      if (run.wrap) return { text: 'wrap-up was already requested.' }
+      if (turnRunning) {
+        // Delivered at Claude's next tool call, or at the end of its turn.
+        run.wrap = 'requested'
+        await $.store.set(storeKey, run)
+        return { text: 'wrap-up requested. Claude gets the message at its next step, finishes the current task, then reports.' }
+      }
+      // Claude is idle (for example waiting on a limit reset): send it now.
+      run.wrap = 'delivered'
+      run.wrapNags = 1
+      await $.store.set(storeKey, run)
+      outbox.push(WRAP_MSG)
+      lastSubmit = 'queued'
+      return { text: 'wrap-up requested. Claude is idle, so the message is going out now.' }
+    }
+
+    const cont = /^continue(?:\s+([0-9]*\.?[0-9]+))?\s*h?$/.exec(args)
+    if (cont) {
+      if (!run) return { text: 'no earlier run to continue. Start one with /longrun <hours> <goal>.' }
+      if (run.active) return { text: 'the run is already active.' }
+      const extra = cont[1] ? Number(cont[1]) : undefined
+      const ms = extra !== undefined ? extra * 3_600_000 : (run.leftMs ?? 0)
+      if (!(ms > 0)) return { text: 'no time was left from the last run: use /longrun continue <hours>.' }
+      const now = await $.clock.now()
+      run.active = true
+      run.deadline = now + ms
+      run.wrap = undefined
+      run.wrapNags = 0
+      run.wrapUp = false
+      run.doneClaims = 0
+      run.idleNudges = 0
+      run.ended = undefined
+      run.resumable = false
+      run.pausedUntil = undefined
+      toolCalls = 0
+      await $.store.set(storeKey, run)
+      outbox.push(
+        `I chose to continue the long run (${fmt(ms)} budget). Goal: ${run.goal}. Pick up exactly where you left off, starting with what you said you planned to do next. The same rules apply.`,
+      )
+      lastSubmit = 'queued'
+      return { text: `continuing with a ${fmt(ms)} budget.` }
+    }
+
     if (args === 'status' || args === '') {
       if (!run?.active) {
         return {
-          text: `longrun: no active run${run?.ended ? ` (last run ended: ${run.ended})` : ''}. Usage: /longrun <hours> <goal>`,
+          text: `no active run${run?.ended ? ` (last run ended: ${run.ended})` : ''}.${run?.resumable ? ' Resume it with /longrun continue.' : ' Usage: /longrun <hours> <goal>'}`,
         }
       }
       const now = await $.clock.now()
@@ -310,9 +394,28 @@ export const register: Register = (on) => {
     return next(e)
   })
 
-  // Count real activity (the budget tool does not count as progress).
+  // Count real activity; deliver a requested wrap-up at the next tool call.
   on('tool.call', async ($, e, next) => {
-    if (e.tool !== 'mcp__longrun__budget') toolCalls++
+    if (e.tool === 'mcp__longrun__budget' || (e as { agentId?: string }).agentId) return next(e)
+    if (run?.active && run.wrap === 'requested') {
+      run.wrap = 'delivered'
+      run.wrapNags = 1
+      await $.store.set(storeKey, run)
+      return {
+        deny: `${WRAP_MSG}\n\n(This tool call was blocked once, only to deliver this message. If it is part of finishing your current step, run it again.)`,
+      }
+    }
+    toolCalls++
+    return next(e)
+  })
+
+  // Is the main loop mid-turn? Decides how a wrap-up request is delivered.
+  on('turn.start', async ($, e, next) => {
+    turnRunning = true
+    return next(e)
+  })
+  on('turn.complete', async ($, e, next) => {
+    if (!e.agentId) turnRunning = false
     return next(e)
   })
 
@@ -384,9 +487,13 @@ export const register: Register = (on) => {
     if (d.end) {
       r.active = false
       r.ended = d.end
+      if (r.wrap) {
+        r.resumable = true
+        r.leftMs = Math.max(0, r.deadline - now)
+      }
       await $.store.set(storeKey, r)
       $.ui.status(undefined)
-      $.ui.toast(`longrun ended: ${d.end}`)
+      $.ui.toast(r.resumable ? 'longrun wrapped up. /longrun continue resumes it.' : `longrun ended: ${d.end}`)
     }
     return next(e)
   })

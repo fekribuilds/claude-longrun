@@ -23,6 +23,7 @@ async function boot($: any, on: any, five = 20, resetsAt?: string, hours = '2') 
   mock.store(on, {})
   on('session.start', ($: any, e: any) => ({ cwd: e.cwd }))
   on('classic.Stop', () => ({}))
+  on('turn.start', ($: any, e: any) => ({ turnId: e.turnId }))
   on('session.id', () => ({ value: 's1' }))
   on('tool.register', () => ({ value: undefined }))
   on('command.register', ($: any, e: any) => ({ value: { command: e.name } }))
@@ -50,6 +51,7 @@ describe('register', () => {
     expect(submitted.length).toBe(1)
     expect(submitted[0]).toContain('LONG RUN MODE')
     expect(submitted[0]).toContain('build the thing')
+    expect(submitted[0]).toContain('authorized to spawn subagents')
     const status: any = await $.command.run({ command: 'longrun', args: 'status', origin: { kind: 'composer' } })
     expect(status.text).toContain('Last prompt sent by longrun: sent')
   })
@@ -86,5 +88,64 @@ describe('register', () => {
     expect(a.block).toBeDefined()
     expect(b.block).toBeDefined()
     expect(c.block).toBeUndefined()
+  })
+
+  const REPORT =
+    'Done this run: refactored the billing module and added tests for the new invoice flow. Planned next: wire the retry logic into the payment client. Open: one flaky test in checkout. Risky: the migration is untested on real data. Do you want me to continue now?'
+
+  const run = ($: any, args: string) => $.command.run({ command: 'longrun', args, origin: { kind: 'composer' } })
+
+  test('wrap while idle sends the wrap-up message, then the report ends the run', async ($, on) => {
+    submitted.length = 0
+    const clock: any = await boot($, on)
+    await clock.advance(1500) // kickoff goes out
+    const r: any = await run($, 'wrap')
+    expect(r.text).toContain('Claude is idle')
+    await clock.advance(1500)
+    expect(submitted.length).toBe(2)
+    expect(submitted[1]).toContain('WRAP-UP REQUESTED')
+    expect(submitted[1]).toContain('Do you want me to continue now?')
+    const stop: any = await $.classic.Stop(stopInput(REPORT))
+    expect(stop.block).toBeUndefined()
+    const status: any = await run($, 'status')
+    expect(status.text).toContain('wrapped up at your request')
+    expect(status.text).toContain('/longrun continue')
+  })
+
+  test('wrap: if Claude does not report, it is asked once more, then released', async ($, on) => {
+    submitted.length = 0
+    const clock: any = await boot($, on)
+    await clock.advance(1500)
+    await run($, 'wrap')
+    const a: any = await $.classic.Stop(stopInput('ok'))
+    expect(a.block).toContain('Do not use any more tools')
+    const b: any = await $.classic.Stop(stopInput('ok'))
+    expect(b.block).toBeUndefined()
+  })
+
+  test('continue resumes a wrapped-up run', async ($, on) => {
+    submitted.length = 0
+    const clock: any = await boot($, on)
+    await clock.advance(1500)
+    await run($, 'wrap')
+    await $.classic.Stop(stopInput(REPORT))
+    const c: any = await run($, 'continue')
+    expect(c.text).toContain('continuing')
+    await clock.advance(3000)
+    expect(submitted.some((t) => t.includes('continue the long run'))).toBe(true)
+    // nudging is back on
+    const r: any = await $.classic.Stop(stopInput('I changed a file.'))
+    expect(r.block).toContain('Keep going')
+  })
+
+  test('wrap mid-turn is delivered when the turn ends', async ($, on) => {
+    submitted.length = 0
+    const clock: any = await boot($, on)
+    await clock.advance(1500)
+    await $.turn.start({ text: '', turnId: 't1' })
+    const r: any = await run($, 'wrap')
+    expect(r.text).toContain('next step')
+    const stop: any = await $.classic.Stop(stopInput('finished a step'))
+    expect(stop.block).toContain('WRAP-UP REQUESTED')
   })
 })

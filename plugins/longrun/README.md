@@ -30,6 +30,11 @@ Then, inside the session:
   line. The first claim triggers one audit pass (re-read goal, run tests, review
   diff). A second claim ends the run. Three nudges in a row with no tool use also
   ends it (stuck guard).
+- **Graceful stop.** `/longrun wrap` delivers a wrap-up request at Claude's next tool
+  call (or at turn end, or immediately if it is idle). Claude finishes only the
+  current step, reports what it did, what it planned next and what is risky, and
+  asks "Do you want me to continue now?". `/longrun continue [hours]` resumes the
+  run with the time that was left.
 - **Wrap-up at the deadline.** One final turn to leave a clean repo, update
   `LONGRUN_NOTES.md`, and summarize. Then it stops.
 - **Model switching by limits.** On every request in the main loop, `turn.step`

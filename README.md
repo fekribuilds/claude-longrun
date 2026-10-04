@@ -28,7 +28,9 @@ unattended run, on a git branch or in a container):
 ```
 /longrun 6 finish the billing refactor and get all tests green
 /longrun status
-/longrun stop
+/longrun wrap        finish the current step, report, ask whether to continue
+/longrun continue    resume after a wrap-up (optionally: /longrun continue 2)
+/longrun stop        end the run immediately
 ```
 
 ## What it does
@@ -39,6 +41,11 @@ unattended run, on a git branch or in a container):
   the first claim triggers one audit (re-read goal, run tests, review diff), the
   second ends the run. Three nudges in a row with no tool use also end it.
 - **Wrap-up turn at the deadline** to leave a clean repo and a summary.
+- **`/longrun wrap`** lets you stop gracefully any time: Claude finishes only its
+  current step, then reports what it did, what it planned next, and anything
+  risky, and asks if you want to continue. `/longrun continue` resumes the timer.
+- **Subagents allowed.** The run tells Claude it may spawn subagents on its own
+  (`allowSubagents` in `CONFIG`).
 - **Switches models by usage limits** (Opus, then Sonnet, then Haiku) based on
   5-hour, 7-day and spend-limit percentages.
 - **Knows its budget.** A `budget` tool and every nudge report time left, limit %,
