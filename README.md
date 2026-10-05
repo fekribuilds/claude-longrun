@@ -29,7 +29,7 @@ unattended run, on a git branch or in a container):
 /longrun 6 finish the billing refactor and get all tests green
 /longrun status
 /longrun wrap        finish the current step, report, ask whether to continue
-/longrun continue    resume after a wrap-up (optionally: /longrun continue 2)
+/longrun continue    resume after a wrap-up, interrupt or pause (optionally: /longrun continue 2)
 /longrun stop        end the run immediately
 ```
 
@@ -50,8 +50,15 @@ unattended run, on a git branch or in a container):
   5-hour, 7-day and spend-limit percentages.
 - **Knows its budget.** A `budget` tool and every nudge report time left, limit %,
   context %, cost and model.
-- **Pauses and resumes** around rate-limit windows when the reset falls before
-  the deadline.
+- **Recovers from usage limits and errors.** A usage limit, overloaded server or
+  dropped connection ends a turn with an API error, and Claude Code does not call
+  the Stop hook for those. A watchdog timer notices the quiet run, reads the real
+  reset time, waits for it (plus a 2 minute grace so Claude Code's own
+  auto-continue can go first), then resumes with the time left. Transient errors
+  retry with backoff (3, 6, 12... min, up to 8 tries). Errors that need you
+  (auth, billing, bad model) end the run. If the reset is after your deadline the
+  run ends. If you press Esc the run pauses and is not auto-resumed; use
+  `/longrun continue`.
 - **Bash guard** against a few catastrophic commands. A safety net, not a sandbox.
 
 Settings live in `CONFIG` at the top of `plugins/longrun/hooks/register.ts`.
@@ -61,7 +68,8 @@ More detail in [plugins/longrun/README.md](plugins/longrun/README.md).
 
 - Plan-limit percentages exist only on subscription plans; on an API key set
   `maxCostUsd` instead.
-- The pause-and-resume timer lives in the session and is lost if you quit.
+- Auto-resume needs the session open: the watchdog is a timer inside the running
+  Claude Code (keep VS Code / the terminal open and the computer awake).
 - Validated and unit-tested for the stop logic; model switching, pause/resume and
   the Bash guard have not been exercised in a live session.
 

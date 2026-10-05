@@ -1,10 +1,12 @@
-import type { Register, SessionUsage } from 'claude-code'
+import type { Register, SessionRateLimit, SessionUsage } from 'claude-code'
 
 // ---------------------------------------------------------------------------
 // longrun: timed autonomous runs for Claude Code.
 //
 //   /longrun <hours> <goal>   start (e.g. /longrun 6 finish the billing refactor)
-//   /longrun status           show time left, limits, model
+//   /longrun status           show time left, limits, model, waiting state
+//   /longrun wrap             finish the current step, report, ask to continue
+//   /longrun continue         resume after a wrap-up, an interruption or a wait
 //   /longrun stop             end the run
 //
 // Run Claude Code with permissions bypassed yourself if you want it fully
@@ -21,7 +23,7 @@ const CONFIG = {
   ladder: ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-4-5-20251001'],
   /** Highest rate-limit % used (5h, 7d or spend) at which to step down a tier. */
   stepDownAt: [70, 90],
-  /** At/above this %, stop working and resume when the window resets. */
+  /** At/above this %, treat the plan as used up and wait for the window to reset. */
   pauseAtPercent: 97,
   /** End the run when session cost passes this many USD. 0 = no cap. */
   maxCostUsd: 0,
@@ -29,7 +31,29 @@ const CONFIG = {
   maxIdleNudges: 3,
   /** Tell Claude it may spawn subagents on its own during a run. */
   allowSubagents: true,
-  /** Status line refresh interval. */
+
+  // --- keeping the run alive when something stops it -------------------------
+  /** After a usage limit resets, wait this long before resuming ourselves, so Claude Code's own automatic continue gets the first chance. */
+  resumeGraceMs: 120_000,
+  /** A run counts as stalled when no turn is running and nothing happened for this long. */
+  idleBeforeResumeMs: 180_000,
+  /** Minutes to wait before each further resume when resumes keep failing with no progress in between. */
+  resumeBackoffMin: [3, 6, 12, 24, 48, 60],
+  /** Give up after this many resumes in a row without progress. */
+  maxResumeAttempts: 8,
+  /** Errors resuming cannot fix: the run ends and tells you. */
+  fatalErrors: [
+    'authentication_failed',
+    'oauth_org_not_allowed',
+    'account_on_hold',
+    'verification_required',
+    'billing_error',
+    'invalid_request',
+    'model_not_found',
+    'cloud_credential_error',
+  ],
+  /** How often the watchdog and the status line check in. */
+  watchdogEveryMs: 30_000,
   statusEveryMs: 30_000,
 }
 
@@ -51,6 +75,7 @@ type Run = {
   doneClaims: number
   wrapUp: boolean
   idleNudges: number
+  /** Waiting for a usage limit to reset (or for the grace after it): do not resume before this time. */
   pausedUntil?: number
   ended?: string
   /** Graceful stop: 'requested' until the message reaches Claude, then 'delivered'. */
@@ -59,6 +84,12 @@ type Run = {
   /** Set when a wrap-up ended the run, so /longrun continue can resume it. */
   resumable?: boolean
   leftMs?: number
+  /** The API error that ended the last turn, until Claude makes progress again. */
+  lastError?: string
+  /** Automatic resumes in a row without progress in between. */
+  resumeAttempts?: number
+  /** You pressed Esc: the run waits for /longrun continue (or your next prompt). */
+  interrupted?: boolean
 }
 
 type Snap = {
@@ -67,9 +98,10 @@ type Snap = {
   spend?: number
   ctx?: number
   cost?: number
-  /** Highest used-% across the plan windows; 0 when none reported. */
+  /** Highest used-% across plan windows that have not reset yet; 0 when none reported. */
   pressure: number
-  resetsAt?: string
+  /** When the last exhausted window resets (ms), if any window is at/above pauseAtPercent. */
+  blockedUntil?: number
 }
 
 type Decision =
@@ -89,13 +121,28 @@ const fmt = (ms: number) => {
 
 const pct = (n?: number) => (n === undefined ? '?' : `${Math.round(n)}%`)
 
-function summarize(u: SessionUsage): Snap {
-  const by = (k: string) => u.rateLimits.find((r) => r.kind === k)
-  const five = by('five_hour')
-  const seven = by('seven_day')
-  const spend = by('spend_limit')
-  const windows = [five, seven, spend].filter((w): w is NonNullable<typeof w> => !!w)
+/**
+ * The usage figures as of `now`. The API only reports a window when a response
+ * comes back, so after a reset the last reading is stale: a window whose
+ * `resetsAt` has passed counts as 0%.
+ */
+function summarize(u: SessionUsage, now: number): Snap {
+  const view = (w?: SessionRateLimit): SessionRateLimit | undefined => {
+    if (!w) return undefined
+    const t = w.resetsAt ? Date.parse(w.resetsAt) : NaN
+    return Number.isFinite(t) && t <= now ? { ...w, percentUsed: 0 } : w
+  }
+  const five = view(u.rateLimits.find((r) => r.kind === 'five_hour'))
+  const seven = view(u.rateLimits.find((r) => r.kind === 'seven_day'))
+  const spend = view(u.rateLimits.find((r) => r.kind === 'spend_limit'))
+  const windows = [five, seven, spend].filter((w): w is SessionRateLimit => !!w)
   const worst = [...windows].sort((a, b) => b.percentUsed - a.percentUsed)[0]
+  let blockedUntil: number | undefined
+  for (const w of windows) {
+    if (w.percentUsed < CONFIG.pauseAtPercent || !w.resetsAt) continue
+    const t = Date.parse(w.resetsAt)
+    if (Number.isFinite(t) && (blockedUntil === undefined || t > blockedUntil)) blockedUntil = t
+  }
   return {
     five: five?.percentUsed,
     seven: seven?.percentUsed,
@@ -103,7 +150,7 @@ function summarize(u: SessionUsage): Snap {
     ctx: u.context.percent,
     cost: u.cost?.usd,
     pressure: worst?.percentUsed ?? 0,
-    resetsAt: worst?.resetsAt,
+    blockedUntil,
   }
 }
 
@@ -121,6 +168,15 @@ function budgetLine(s: Snap, left: number, model: string): string {
   if (s.cost !== undefined) parts.push(`cost $${s.cost.toFixed(2)}`)
   parts.push(`model ${model ? short(model) : '?'}`)
   return parts.join(' | ')
+}
+
+function statusText(r: Run, s: Snap, now: number, model: string): string {
+  const state = r.interrupted
+    ? 'paused (you interrupted) | '
+    : r.pausedUntil && r.pausedUntil > now
+      ? `waiting for usage limit, resumes in ${fmt(r.pausedUntil - now)} | `
+      : ''
+  return `longrun ${state}${budgetLine(s, r.deadline - now, model)}`
 }
 
 const DONE_LINE = new RegExp(`^\\s*${CONFIG.marker}\\s*$`, 'm')
@@ -141,6 +197,12 @@ const WRAP_NAG =
 const SUBAGENT_LINE =
   '- You are explicitly authorized to spawn subagents (the Agent tool) on your own whenever it helps: independent reviewers, parallel research, verification passes, long searches. Treat this as my direct request to use them; do not wait to be asked.'
 
+const deadlineMsg = (line: string) =>
+  `Time is up (${line}). Do not start new work. Get the repo into a clean, consistent state (tests passing if possible, work committed), update LONGRUN_NOTES.md, and give a short final summary: what is done, what is left, how to continue.`
+
+const resumeMsg = (goal: string, left: number, line: string) =>
+  `The long run was interrupted (usage limit, connection or server error) and is now continuing automatically. ${fmt(left)} remain${line ? ` (${line})` : ''}. Goal: ${goal}. Pick up exactly where you left off: first check the repo state (git status, your last commit, LONGRUN_NOTES.md), then carry on with what you were doing. The same rules apply.`
+
 function kickoff(goal: string, hours: number): string {
   return [
     `LONG RUN MODE. You may work autonomously for up to ${hours}h on: ${goal}`,
@@ -152,7 +214,7 @@ function kickoff(goal: string, hours: number): string {
     `- When truly nothing is left (goal met, tests and lint pass, self-review done), end your message with ${CONFIG.marker} alone on its own line. I will audit that claim once before accepting it.`,
     ...(CONFIG.allowSubagents ? [SUBAGENT_LINE] : []),
     '- Call the mcp__longrun__budget tool whenever you want to see time left, rate-limit usage, context fill and the current model.',
-    '- If usage limits run out, the session pauses and resumes by itself after the window resets.',
+    '- If a usage limit stops you, the run waits for the reset and resumes by itself; keep your work committed so nothing is lost.',
   ].join('\n')
 }
 
@@ -184,11 +246,10 @@ function decide(
     return { kind: 'allow', end: `cost cap $${CONFIG.maxCostUsd} reached` }
   }
 
-  // Out of plan limits: sleep until the window resets, if that is before the deadline.
+  // Plan limits used up: wait for the reset (the watchdog resumes the run), if it comes before the deadline.
   if (s.pressure >= CONFIG.pauseAtPercent) {
-    const resetAt = s.resetsAt ? Date.parse(s.resetsAt) : NaN
-    if (Number.isFinite(resetAt) && resetAt + 30_000 < r.deadline) {
-      return { kind: 'pause', until: resetAt + 30_000 }
+    if (s.blockedUntil !== undefined && s.blockedUntil + CONFIG.resumeGraceMs < r.deadline) {
+      return { kind: 'pause', until: s.blockedUntil + CONFIG.resumeGraceMs }
     }
     return { kind: 'allow', end: `usage limits exhausted (${pct(s.pressure)}) and no reset before the deadline` }
   }
@@ -197,10 +258,7 @@ function decide(
   if (left <= 0) {
     if (!r.wrapUp) {
       r.wrapUp = true
-      return {
-        kind: 'block',
-        text: `Time is up (${line}). Do not start new work. Get the repo into a clean, consistent state (tests passing if possible, work committed), update LONGRUN_NOTES.md, and give a short final summary: what is done, what is left, how to continue.`,
-      }
+      return { kind: 'block', text: deadlineMsg(line) }
     }
     return { kind: 'allow', end: 'deadline reached' }
   }
@@ -239,23 +297,35 @@ export const register: Register = (on) => {
   const outbox: string[] = []
   let lastSubmit = 'none yet'
   let turnRunning = false
+  let lastActivity = 0
+  let lastResumeAt = 0
+  let watchdogBusy = false
 
   on('session.start', async ($, e, next) => {
     storeKey = `longrun:${await $.session.id()}`
+    const now = await $.clock.now()
+    lastActivity = now
     const saved = (await $.store.get(storeKey)) as Run | null | undefined
-    if (saved) run = saved
+    if (saved) {
+      run = saved
+      // A run left over from a session closed long ago must not wake up and send prompts.
+      if (run.active && now - run.deadline > 600_000) {
+        run.active = false
+        run.ended = 'the deadline passed while the session was closed'
+        await $.store.set(storeKey, run)
+      }
+    }
 
     // Live status line, refreshed on a timer.
     $.clock.every(CONFIG.statusEveryMs, async () => {
       if (!run?.active) return
-      const now = await $.clock.now()
-      const s = summarize(await $.session.usage())
-      const pause = run.pausedUntil ? `paused until reset (${fmt(run.pausedUntil - now)}) | ` : ''
-      $.ui.status(`longrun ${pause}${budgetLine(s, run.deadline - now, lastModel)}`)
+      const t = await $.clock.now()
+      const s = summarize(await $.session.usage(), t)
+      $.ui.status(statusText(run, s, t, lastModel))
     })
 
-    // Prompts to send are queued here and sent from this timer, the documented
-    // pattern for starting a turn from outside an event.
+    // Prompts to send are queued in `outbox` and sent from this timer, the
+    // documented pattern for starting a turn from outside an event.
     $.clock.every(1000, async () => {
       const text = outbox.shift()
       if (!text) return
@@ -267,6 +337,91 @@ export const register: Register = (on) => {
       } catch (err) {
         lastSubmit = `failed: ${String(err)}`
         $.ui.toast(`longrun: could not start a turn: ${String(err)}`)
+      }
+    })
+
+    // The watchdog: a run that goes quiet is brought back. A usage limit, an
+    // overloaded server or a dropped connection end the turn with an API error
+    // and Claude Code does not call the Stop hook for those, so nothing else
+    // would ever restart it.
+    $.clock.every(CONFIG.watchdogEveryMs, async () => {
+      if (watchdogBusy || !run?.active || turnRunning || run.interrupted || outbox.length > 0) return
+      watchdogBusy = true
+      try {
+        const r = run
+        const t = await $.clock.now()
+        if (t - lastActivity < CONFIG.idleBeforeResumeMs) return
+        const s = summarize(await $.session.usage(), t)
+        const left = r.deadline - t
+        const finish = async (why: string) => {
+          r.active = false
+          r.ended = why
+          if (r.wrap) {
+            r.resumable = true
+            r.leftMs = Math.max(0, left)
+          }
+          await $.store.set(storeKey, r)
+          $.ui.status(undefined)
+          $.ui.toast(`longrun ended: ${why}`)
+        }
+
+        // 1. The deadline passed while Claude was down.
+        if (left <= 0) {
+          if (s.blockedUntil !== undefined || r.wrapUp) {
+            await finish(`deadline reached${s.blockedUntil !== undefined ? ' while waiting for the usage limit' : ''}`)
+            return
+          }
+          r.wrapUp = true
+          await $.store.set(storeKey, r)
+          outbox.push(deadlineMsg(budgetLine(s, 0, lastModel)))
+          lastSubmit = 'queued (deadline)'
+          return
+        }
+
+        // 2. An error that resuming cannot fix.
+        if (r.lastError && CONFIG.fatalErrors.includes(r.lastError)) {
+          await finish(`stopped by an error that needs you: ${r.lastError}`)
+          return
+        }
+
+        // 3. A usage limit is still active: wait for the reset.
+        if (s.blockedUntil !== undefined) {
+          const until = s.blockedUntil + CONFIG.resumeGraceMs
+          if (until >= r.deadline) {
+            await finish('the usage limit resets after your deadline')
+            return
+          }
+          if (r.pausedUntil !== until) {
+            r.pausedUntil = until
+            await $.store.set(storeKey, r)
+            $.ui.toast(`longrun: usage limit reached, resuming in ${fmt(until - t)}`)
+          }
+          return
+        }
+        // The window just reset: give Claude Code's own automatic continue the first chance.
+        if (r.pausedUntil && t < r.pausedUntil) return
+
+        // 4. Resume, backing off if resumes keep failing without progress.
+        const attempts = r.resumeAttempts ?? 0
+        if (attempts >= CONFIG.maxResumeAttempts) {
+          await finish(`could not resume after ${attempts} tries (last error: ${r.lastError ?? 'none'})`)
+          return
+        }
+        const backoff = CONFIG.resumeBackoffMin[Math.min(attempts - 1, CONFIG.resumeBackoffMin.length - 1)]
+        const need = attempts === 0 || backoff === undefined ? 0 : backoff * 60_000
+        if (t - Math.max(lastActivity, lastResumeAt) < need) return
+
+        r.pausedUntil = undefined
+        r.resumeAttempts = attempts + 1
+        lastResumeAt = t
+        await $.store.set(storeKey, r)
+        outbox.push(r.wrap ? WRAP_MSG : resumeMsg(r.goal, left, budgetLine(s, left, lastModel)))
+        lastSubmit = `queued (auto-resume ${attempts + 1})`
+        $.ui.toast('longrun: resuming automatically')
+      } catch (err) {
+        $.ui.log(`longrun watchdog: ${String(err)}`)
+      } finally {
+        watchdogBusy = false
       }
     })
 
@@ -314,6 +469,8 @@ export const register: Register = (on) => {
       // Claude is idle (for example waiting on a limit reset): send it now.
       run.wrap = 'delivered'
       run.wrapNags = 1
+      run.interrupted = false
+      run.pausedUntil = undefined
       await $.store.set(storeKey, run)
       outbox.push(WRAP_MSG)
       lastSubmit = 'queued'
@@ -323,11 +480,22 @@ export const register: Register = (on) => {
     const cont = /^continue(?:\s+([0-9]*\.?[0-9]+))?\s*h?$/.exec(args)
     if (cont) {
       if (!run) return { text: 'no earlier run to continue. Start one with /longrun <hours> <goal>.' }
-      if (run.active) return { text: 'the run is already active.' }
+      const now = await $.clock.now()
+      if (run.active) {
+        // Resume a run that is paused, interrupted or waiting, right now.
+        if (turnRunning) return { text: 'Claude is already working; nothing to resume.' }
+        run.interrupted = false
+        run.pausedUntil = undefined
+        run.resumeAttempts = 0
+        run.lastError = undefined
+        await $.store.set(storeKey, run)
+        outbox.push(run.wrap ? WRAP_MSG : resumeMsg(run.goal, run.deadline - now, ''))
+        lastSubmit = 'queued'
+        return { text: 'resuming now.' }
+      }
       const extra = cont[1] ? Number(cont[1]) : undefined
       const ms = extra !== undefined ? extra * 3_600_000 : (run.leftMs ?? 0)
       if (!(ms > 0)) return { text: 'no time was left from the last run: use /longrun continue <hours>.' }
-      const now = await $.clock.now()
       run.active = true
       run.deadline = now + ms
       run.wrap = undefined
@@ -338,7 +506,11 @@ export const register: Register = (on) => {
       run.ended = undefined
       run.resumable = false
       run.pausedUntil = undefined
+      run.interrupted = false
+      run.lastError = undefined
+      run.resumeAttempts = 0
       toolCalls = 0
+      lastActivity = now
       await $.store.set(storeKey, run)
       outbox.push(
         `I chose to continue the long run (${fmt(ms)} budget). Goal: ${run.goal}. Pick up exactly where you left off, starting with what you said you planned to do next. The same rules apply.`,
@@ -354,8 +526,14 @@ export const register: Register = (on) => {
         }
       }
       const now = await $.clock.now()
-      const s = summarize(await $.session.usage())
-      return { text: `${budgetLine(s, run.deadline - now, lastModel)}\nGoal: ${run.goal}\nLast prompt sent by longrun: ${lastSubmit}` }
+      const s = summarize(await $.session.usage(), now)
+      const lines = [budgetLine(s, run.deadline - now, lastModel), `Goal: ${run.goal}`]
+      if (run.interrupted) lines.push('Paused because you interrupted. /longrun continue resumes it.')
+      else if (run.pausedUntil && run.pausedUntil > now) lines.push(`Waiting for the usage limit to reset: resumes in ${fmt(run.pausedUntil - now)}.`)
+      else if (!turnRunning && now - lastActivity > CONFIG.idleBeforeResumeMs) lines.push('Claude is idle; the watchdog will resume the run.')
+      if (run.lastError) lines.push(`Last error: ${run.lastError} (auto-resume attempts: ${run.resumeAttempts ?? 0})`)
+      lines.push(`Last prompt sent by longrun: ${lastSubmit}`)
+      return { text: lines.join('\n') }
     }
 
     const m = /^([0-9]*\.?[0-9]+)\s*h?\s*([\s\S]*)$/.exec(args)
@@ -375,6 +553,7 @@ export const register: Register = (on) => {
       idleNudges: 0,
     }
     toolCalls = 0
+    lastActivity = now
     await $.store.set(storeKey, run)
     // Sent by the session.start timer; awaiting a submit inside a hook can hang.
     outbox.push(kickoff(goal, hours))
@@ -397,6 +576,7 @@ export const register: Register = (on) => {
   // Count real activity; deliver a requested wrap-up at the next tool call.
   on('tool.call', async ($, e, next) => {
     if (e.tool === 'mcp__longrun__budget' || (e as { agentId?: string }).agentId) return next(e)
+    lastActivity = await $.clock.now()
     if (run?.active && run.wrap === 'requested') {
       run.wrap = 'delivered'
       run.wrapNags = 1
@@ -406,16 +586,52 @@ export const register: Register = (on) => {
       }
     }
     toolCalls++
+    // Real progress: forget earlier errors and failed resumes.
+    if (run?.active && (run.lastError || run.resumeAttempts)) {
+      run.lastError = undefined
+      run.resumeAttempts = 0
+    }
     return next(e)
   })
 
-  // Is the main loop mid-turn? Decides how a wrap-up request is delivered.
+  // Is the main loop mid-turn? Decides how a wrap-up request is delivered and
+  // whether the watchdog may act.
   on('turn.start', async ($, e, next) => {
     turnRunning = true
+    lastActivity = await $.clock.now()
+    if (run?.interrupted) run.interrupted = false // you sent a prompt: you are driving again
     return next(e)
   })
   on('turn.complete', async ($, e, next) => {
-    if (!e.agentId) turnRunning = false
+    if (!e.agentId) {
+      turnRunning = false
+      lastActivity = await $.clock.now()
+      if (run?.active && e.isAborted) {
+        run.interrupted = true
+        await $.store.set(storeKey, run)
+        $.ui.toast('longrun: paused because you interrupted. /longrun continue resumes, /longrun stop ends it.')
+      }
+    }
+    return next(e)
+  })
+
+  // A turn that dies on an API error (usage limit, overloaded server, ...) gets
+  // StopFailure instead of Stop. Note the error; the watchdog does the rest.
+  on('classic.StopFailure', async ($, e, next) => {
+    if (run?.active && !e.agent_id) {
+      run.lastError = e.error
+      turnRunning = false
+      lastActivity = await $.clock.now()
+      await $.store.set(storeKey, run)
+      const fatal = CONFIG.fatalErrors.includes(e.error)
+      $.ui.toast(
+        fatal
+          ? `longrun: stopped by an error that needs you (${e.error})`
+          : e.error === 'rate_limit'
+            ? 'longrun: usage limit reached, will resume after the reset'
+            : `longrun: turn failed (${e.error}), will retry`,
+      )
+    }
     return next(e)
   })
 
@@ -423,7 +639,7 @@ export const register: Register = (on) => {
   on('tool.call', { tool: 'mcp__longrun__budget' }, async ($) => {
     if (!run?.active) return { result: 'No active longrun. Start one with /longrun <hours> <goal>.' }
     const now = await $.clock.now()
-    const s = summarize(await $.session.usage())
+    const s = summarize(await $.session.usage(), now)
     const noLimits = s.five === undefined && s.seven === undefined && s.spend === undefined
     const note = noLimits ? ' (no plan-limit readings yet: API-key use, or no response reported them)' : ''
     return { result: budgetLine(s, run.deadline - now, lastModel) + note }
@@ -432,7 +648,9 @@ export const register: Register = (on) => {
   // Choose the model per request from the usage limits (main loop only).
   on('turn.step', async function* ($, e, next) {
     if (!run?.active || e.agentId) return yield* next(e)
-    const s = summarize(await $.session.usage())
+    const now = await $.clock.now()
+    lastActivity = now
+    const s = summarize(await $.session.usage(), now)
     const forced = pickModel(s)
     const target = forced ?? e.model
     if (target !== lastModel) {
@@ -447,9 +665,8 @@ export const register: Register = (on) => {
   on('session.measure', async ($, e, next) => {
     if (run?.active) {
       const now = await $.clock.now()
-      const s = summarize(await $.session.usage())
-      const pause = run.pausedUntil ? `paused until reset (${fmt(run.pausedUntil - now)}) | ` : ''
-      $.ui.status(`longrun ${pause}${budgetLine(s, run.deadline - now, lastModel)}`)
+      const s = summarize(await $.session.usage(), now)
+      $.ui.status(statusText(run, s, now, lastModel))
     }
     return next(e)
   })
@@ -460,10 +677,13 @@ export const register: Register = (on) => {
     if (!r?.active) return next(e)
 
     const now = await $.clock.now()
-    const s = summarize(await $.session.usage())
+    const s = summarize(await $.session.usage(), now)
     const line = budgetLine(s, r.deadline - now, lastModel)
     const touched = toolCalls > 0
     toolCalls = 0
+    // A normal stop means Claude was working: earlier errors are behind us.
+    r.lastError = undefined
+    r.resumeAttempts = 0
 
     const d = decide(r, s, now, e.last_assistant_message ?? '', touched, line)
 
@@ -475,12 +695,7 @@ export const register: Register = (on) => {
     if (d.kind === 'pause') {
       r.pausedUntil = d.until
       await $.store.set(storeKey, r)
-      $.ui.toast(`longrun: limits at ${pct(s.pressure)}, pausing until reset`)
-      $.clock.after(Math.max(1000, d.until - now), async () => {
-        if (!run?.active) return
-        run.pausedUntil = undefined
-        outbox.push('The usage-limit window has reset. Continue the long run where you left off.')
-      })
+      $.ui.toast(`longrun: limits at ${pct(s.pressure)}, resuming in ${fmt(d.until - now)}`)
       return next(e)
     }
 

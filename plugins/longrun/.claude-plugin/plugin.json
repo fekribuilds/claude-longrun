@@ -1,6 +1,5 @@
 {
   "name": "longrun",
-  "version": "0.2.0",
-  "description": "Timed autonomous runs: keeps Claude working until a deadline, stops early when truly done, switches models by usage limits, and pauses/resumes around rate-limit windows.",
-  "license": "MIT"
+  "version": "0.3.0",
+  "description": "Timed autonomous runs: keeps Claude working until a deadline, stops early when truly done, switches models by usage limits, and pauses/resumes around rate-limit windows."
 }

@@ -43,8 +43,15 @@ Then, inside the session:
 - **Knows its remaining budget.** The `mcp__longrun__budget` tool returns time
   left, 5h/7d %, context %, cost and model. The same line is in every nudge and
   in the status line.
-- **Pause and resume around limits.** At 97%+ it lets Claude stop, then submits a
-  "continue" prompt after the window resets, if that is before the deadline.
+- **Recovers from usage limits and errors.** A usage limit, overloaded server or
+  dropped connection ends a turn with an API error, and Claude Code does not call
+  the Stop hook for those. A watchdog timer notices the quiet run, reads the real
+  reset time, waits for it (plus a 2 minute grace so Claude Code's own
+  auto-continue can go first), then resumes with the time left. Transient errors
+  retry with backoff (3, 6, 12... min, up to 8 tries). Errors that need you
+  (auth, billing, bad model) end the run. If the reset is after your deadline the
+  run ends. If you press Esc the run pauses and is not auto-resumed; use
+  `/longrun continue`.
 - **Bash guard.** Blocks a few catastrophic commands (rm -rf on root/home,
   force-push or direct push to main/master, mkfs/dd to a device, curl | sh).
   This is a safety net, not a sandbox.
@@ -62,8 +69,8 @@ Run `/reload-plugins` after editing.
 - Plan-limit percentages exist only on subscription plans. On an API key they are
   empty: model switching then stays on the top tier and pausing never triggers, so
   set `maxCostUsd` instead.
-- The pause-and-resume timer lives in the session. If you quit Claude Code, the
-  run state is saved but the timer is lost.
+- Auto-resume needs the session open: the watchdog is a timer inside the running
+  Claude Code (keep VS Code / the terminal open and the computer awake).
 - Verified by `claude plugin validate` and `claude plugin test` (stop logic:
   nudging, done audit, deadline wrap-up, stuck guard). Model switching,
   pause/resume and the Bash guard are validated but were not exercised in a live
